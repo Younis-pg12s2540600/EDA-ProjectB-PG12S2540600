@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -9,6 +8,10 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
 OPENROUTER_MODEL = "openai/gpt-oss-20b:free"
 
@@ -62,7 +65,7 @@ st.set_page_config(
 )
 
 st.title("EDA Mini Project B — Time-Series Forecasting Starter")
-st.caption("Starter app stops after data audit, time-series setup, baseline feature table, exports, and AI grader.")
+st.caption("Time-series forecasting app with data audit, feature engineering, models, dashboard evidence, exports, and AI grader.")
 
 # -----------------------------
 # Helpers
@@ -302,100 +305,144 @@ st.dataframe(feature_table.head(20), use_container_width=True)
 # -----------------------------
 st.header("5. STUDENT ADDITIONS — Modeling")
 
-st.warning(
-    "Starter code intentionally does not train models or calculate metrics. "
-    "Add your forecasting models, time-based split, predictions, and metrics under this marker."
+st.success(
+    "This section adds student forecasting work: extra features, a time-based split, "
+    "hyperparameter tuning, multiple models, predictions, and metrics."
 )
 
-st.code(
-    """
-# STUDENT ADDITIONS: MODELING
-# This completed section trains forecasting models with a time-based split.
-# Outputs:
-# - results_df: metrics table used by the exporter and AI grader
-# - predictions_df: actual vs predicted values for dashboard plots
-""",
-    language="python",
-)
-
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-
-model_df = feature_table.copy()
-
-# Extra student-created time-series features
-model_df["dayofweek"] = model_df[timestamp_col].dt.dayofweek
-model_df["quarter"] = model_df[timestamp_col].dt.quarter
-model_df["lag_7"] = model_df[target_col].shift(7)
-model_df["rolling_mean_7"] = model_df[target_col].shift(1).rolling(window=7, min_periods=7).mean()
-model_df["rolling_std_7"] = model_df[target_col].shift(1).rolling(window=7, min_periods=7).std()
-
-student_feature_cols = feature_cols + [
-    "dayofweek",
-    "quarter",
-    "lag_7",
-    "rolling_mean_7",
-    "rolling_std_7",
-]
-
-model_df = model_df.dropna(subset=student_feature_cols + ["y_target"]).copy()
-
-if len(model_df) < 40:
-    st.error("Not enough prepared rows for modeling. Try horizon = 1 and resampling = None.")
+if len(feature_table) < 80:
+    st.error("Not enough feature rows to train and test models reliably. Try a smaller forecast horizon.")
     results_df = None
     predictions_df = pd.DataFrame()
-    best_model_name = ""
-    split_index = 0
+    best_model_name = None
+    best_model = None
+    student_feature_cols = feature_cols
+    hyperparameter_summary = []
 else:
+    model_df = feature_table.copy()
+
+    # Extra student-created time-series features beyond the starter baseline.
+    model_df["dayofweek"] = model_df[timestamp_col].dt.dayofweek
+    model_df["quarter"] = model_df[timestamp_col].dt.quarter
+    model_df["lag_7"] = model_df[target_col].shift(7)
+    model_df["rolling_mean_7"] = model_df[target_col].shift(1).rolling(7).mean()
+    model_df["rolling_std_7"] = model_df[target_col].shift(1).rolling(7).std()
+
+    student_feature_cols = feature_cols + [
+        "dayofweek",
+        "quarter",
+        "lag_7",
+        "rolling_mean_7",
+        "rolling_std_7",
+    ]
+
+    model_df = model_df.dropna(subset=student_feature_cols + ["y_target"]).copy()
+
     X_model = model_df[student_feature_cols]
     y_model = model_df["y_target"]
 
-    # Time-based train/test split: train on earlier dates, test on later dates
+    # Time-based train/test split: earlier observations train, later observations test.
     split_index = int(len(model_df) * 0.8)
+
     X_train = X_model.iloc[:split_index]
     X_test = X_model.iloc[split_index:]
     y_train = y_model.iloc[:split_index]
     y_test = y_model.iloc[split_index:]
 
-    models = {
-        "Ridge Regression": Ridge(alpha=1.0),
-        "Random Forest": RandomForestRegressor(
-            n_estimators=120,
-            random_state=42,
-            min_samples_leaf=3,
-        ),
-        "Gradient Boosting": GradientBoostingRegressor(random_state=42),
+    st.subheader("Time-based train/test split")
+    st.write(f"Training rows: **{len(X_train):,}**")
+    st.write(f"Testing rows: **{len(X_test):,}**")
+    st.write(
+        "The split is chronological, so the models train on earlier dates and test on later dates. "
+        "This reduces look-ahead leakage in a forecasting project."
+    )
+
+    # Small hyperparameter grids to keep Streamlit Cloud fast and reliable.
+    model_grids = {
+        "Ridge Regression": {
+            "model": Ridge(),
+            "params": {"alpha": [0.1, 1.0, 10.0, 50.0]},
+        },
+        "Random Forest": {
+            "model": RandomForestRegressor(random_state=42, n_estimators=120),
+            "params": {
+                "max_depth": [3, 6, None],
+                "min_samples_leaf": [1, 3, 5],
+            },
+        },
+        "Gradient Boosting": {
+            "model": GradientBoostingRegressor(random_state=42),
+            "params": {
+                "learning_rate": [0.03, 0.05, 0.1],
+                "max_depth": [2, 3],
+                "n_estimators": [80, 120],
+            },
+        },
     }
 
+    tscv = TimeSeriesSplit(n_splits=3)
     results = []
     prediction_store = {}
+    fitted_models = {}
+    hyperparameter_summary = []
 
-    for model_name, model in models.items():
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
+    rng = np.random.default_rng(42)
+
+    for model_name, config in model_grids.items():
+        grid = GridSearchCV(
+            estimator=config["model"],
+            param_grid=config["params"],
+            scoring="neg_root_mean_squared_error",
+            cv=tscv,
+            n_jobs=-1,
+        )
+        grid.fit(X_train, y_train)
+
+        best_estimator = grid.best_estimator_
+        preds = best_estimator.predict(X_test)
 
         mae = mean_absolute_error(y_test, preds)
         rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
-        denominator = np.where(y_test.values == 0, np.nan, y_test.values)
-        mape = float(np.nanmean(np.abs((y_test.values - preds) / denominator)) * 100)
+        mape = float(np.nanmean(np.abs((y_test.values - preds) / np.where(y_test.values == 0, np.nan, y_test.values))) * 100)
         r2 = r2_score(y_test, preds)
+
+        # Simple bootstrap confidence interval for RMSE on the test period.
+        squared_errors = (y_test.values - preds) ** 2
+        boot_rmse = []
+        for _ in range(300):
+            sample = rng.choice(squared_errors, size=len(squared_errors), replace=True)
+            boot_rmse.append(float(np.sqrt(np.mean(sample))))
+        rmse_ci_low, rmse_ci_high = np.percentile(boot_rmse, [2.5, 97.5])
 
         results.append(
             {
                 "model": model_name,
                 "MAE": round(float(mae), 3),
                 "RMSE": round(float(rmse), 3),
+                "RMSE_CI_low": round(float(rmse_ci_low), 3),
+                "RMSE_CI_high": round(float(rmse_ci_high), 3),
                 "MAPE_%": round(float(mape), 3),
                 "R2": round(float(r2), 3),
+                "best_params": str(grid.best_params_),
+                "cv_best_RMSE": round(float(-grid.best_score_), 3),
             }
         )
 
         prediction_store[model_name] = preds
+        fitted_models[model_name] = best_estimator
+        hyperparameter_summary.append(
+            {
+                "model": model_name,
+                "best_params": grid.best_params_,
+                "cv_best_RMSE": round(float(-grid.best_score_), 3),
+            }
+        )
 
     results_df = pd.DataFrame(results).sort_values("RMSE").reset_index(drop=True)
-    best_model_name = str(results_df.iloc[0]["model"])
+
+    best_model_name = results_df.iloc[0]["model"]
     best_predictions = prediction_store[best_model_name]
+    best_model = fitted_models[best_model_name]
 
     predictions_df = pd.DataFrame(
         {
@@ -406,39 +453,80 @@ else:
         }
     )
 
-    st.subheader("Time-based train/test split")
-    st.write(f"Training rows: **{len(X_train):,}**")
-    st.write(f"Testing rows: **{len(X_test):,}**")
-    st.write("The split uses earlier dates for training and later dates for testing.")
-
     st.subheader("Model metrics table")
     st.dataframe(results_df, use_container_width=True)
-
     st.success(f"Best model by RMSE: {best_model_name}")
+
+    st.subheader("Hyperparameter tuning summary")
+    st.dataframe(pd.DataFrame(hyperparameter_summary), use_container_width=True)
+
+    # Alternative weekly resampling robustness check.
+    weekly_robustness_df = pd.DataFrame()
+    try:
+        weekly_df = (
+            work_df[[timestamp_col, target_col]]
+            .set_index(timestamp_col)
+            .resample("W")[target_col]
+            .mean()
+            .reset_index()
+            .dropna(subset=[target_col])
+        )
+        if len(weekly_df) > 60:
+            weekly_features, weekly_X, weekly_y, weekly_cols = make_baseline_features(
+                weekly_df,
+                timestamp_col=timestamp_col,
+                target_col=target_col,
+                horizon=1,
+            )
+            if len(weekly_features) > 40:
+                weekly_split = int(len(weekly_features) * 0.8)
+                weekly_model = Ridge(alpha=1.0)
+                weekly_model.fit(weekly_X.iloc[:weekly_split], weekly_y.iloc[:weekly_split])
+                weekly_preds = weekly_model.predict(weekly_X.iloc[weekly_split:])
+                weekly_rmse = float(np.sqrt(mean_squared_error(weekly_y.iloc[weekly_split:], weekly_preds)))
+                weekly_mae = float(mean_absolute_error(weekly_y.iloc[weekly_split:], weekly_preds))
+                weekly_robustness_df = pd.DataFrame(
+                    [{
+                        "frequency": "Weekly",
+                        "model": "Ridge Regression",
+                        "horizon": 1,
+                        "MAE": round(weekly_mae, 3),
+                        "RMSE": round(weekly_rmse, 3),
+                        "rows": int(len(weekly_features)),
+                    }]
+                )
+    except Exception:
+        weekly_robustness_df = pd.DataFrame()
+
+    if not weekly_robustness_df.empty:
+        st.subheader("Alternative resampling robustness check")
+        st.dataframe(weekly_robustness_df, use_container_width=True)
+        st.write(
+            "This check demonstrates an alternative weekly frequency. The main model remains daily "
+            "because daily forecasting preserves more observations and gives a more detailed forecast."
+        )
 
 # -----------------------------
 # STUDENT ADDITIONS: DASHBOARD
 # -----------------------------
 st.header("6. STUDENT ADDITIONS — Dashboard")
 
-st.info("Add extra plots, KPIs, interpretation, and error analysis under this marker.")
+st.info("Dashboard evidence includes actual vs predicted values, residual diagnostics, model comparison, feature importance, and resampling robustness.")
 
-st.code(
-    """
-# STUDENT ADDITIONS: DASHBOARD
-# Add visual evidence here.
-# Suggested ideas:
-# - Actual vs predicted line chart
-# - Error distribution
-# - Monthly/weekday patterns
-# - Model comparison table
-""",
-    language="python",
-)
+dashboard_plot_count = 0
 
-if isinstance(results_df, pd.DataFrame):
+if isinstance(results_df, pd.DataFrame) and not results_df.empty:
+    kpi_a, kpi_b, kpi_c, kpi_d = st.columns(4)
+    with kpi_a:
+        st.metric("Best model", best_model_name)
+    with kpi_b:
+        st.metric("Best RMSE", results_df.iloc[0]["RMSE"])
+    with kpi_c:
+        st.metric("Best MAE", results_df.iloc[0]["MAE"])
+    with kpi_d:
+        st.metric("Best R2", results_df.iloc[0]["R2"])
+
     st.subheader("Actual vs predicted consumption")
-
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(predictions_df["timestamp"], predictions_df["actual"], label="Actual")
     ax.plot(predictions_df["timestamp"], predictions_df["predicted"], label="Predicted")
@@ -447,9 +535,9 @@ if isinstance(results_df, pd.DataFrame):
     ax.set_title(f"Actual vs Predicted — {best_model_name}")
     ax.legend()
     st.pyplot(fig)
+    dashboard_plot_count += 1
 
     st.subheader("Prediction error over time")
-
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(predictions_df["timestamp"], predictions_df["error"])
     ax.axhline(0, linestyle="--")
@@ -457,9 +545,18 @@ if isinstance(results_df, pd.DataFrame):
     ax.set_ylabel("Prediction error")
     ax.set_title("Forecast Error Over Time")
     st.pyplot(fig)
+    dashboard_plot_count += 1
 
-    st.subheader("Model comparison")
+    st.subheader("Residual distribution")
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.hist(predictions_df["error"], bins=30)
+    ax.set_xlabel("Prediction error")
+    ax.set_ylabel("Count")
+    ax.set_title("Residual Distribution")
+    st.pyplot(fig)
+    dashboard_plot_count += 1
 
+    st.subheader("Model comparison by RMSE")
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.bar(results_df["model"], results_df["RMSE"])
     ax.set_xlabel("Model")
@@ -467,23 +564,91 @@ if isinstance(results_df, pd.DataFrame):
     ax.set_title("Model Comparison by RMSE")
     plt.xticks(rotation=20)
     st.pyplot(fig)
+    dashboard_plot_count += 1
 
-    st.subheader("Key performance indicators")
-    best_row = results_df.iloc[0]
-    kpi_a, kpi_b, kpi_c = st.columns(3)
-    kpi_a.metric("Best model", best_model_name)
-    kpi_b.metric("Best RMSE", best_row["RMSE"])
-    kpi_c.metric("Best MAE", best_row["MAE"])
+    st.subheader("Feature importance / model interpretability")
+    if hasattr(best_model, "feature_importances_"):
+        importances = pd.Series(
+            best_model.feature_importances_,
+            index=student_feature_cols,
+        ).sort_values(ascending=False)
+
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.bar(importances.index, importances.values)
+        ax.set_xlabel("Feature")
+        ax.set_ylabel("Importance")
+        ax.set_title(f"Feature Importance — {best_model_name}")
+        plt.xticks(rotation=35, ha="right")
+        st.pyplot(fig)
+        dashboard_plot_count += 1
+
+        st.write(
+            "This chart improves interpretability by showing which lag, rolling, "
+            "and calendar features contributed most to the selected tree-based model."
+        )
+    elif hasattr(best_model, "coef_"):
+        coefficients = pd.Series(
+            best_model.coef_,
+            index=student_feature_cols,
+        ).sort_values(key=lambda s: s.abs(), ascending=False)
+
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.bar(coefficients.index, coefficients.values)
+        ax.set_xlabel("Feature")
+        ax.set_ylabel("Coefficient")
+        ax.set_title(f"Ridge Coefficients — {best_model_name}")
+        plt.xticks(rotation=35, ha="right")
+        st.pyplot(fig)
+        dashboard_plot_count += 1
+
+        st.write(
+            "This chart improves interpretability by showing which features have the largest "
+            "positive or negative coefficients in the selected Ridge model."
+        )
+
+    if "weekly_robustness_df" in globals() and isinstance(weekly_robustness_df, pd.DataFrame) and not weekly_robustness_df.empty:
+        st.subheader("Weekly resampling robustness visual")
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.bar(weekly_robustness_df["frequency"], weekly_robustness_df["RMSE"])
+        ax.set_xlabel("Alternative frequency")
+        ax.set_ylabel("RMSE")
+        ax.set_title("Alternative Weekly Resampling Check")
+        st.pyplot(fig)
+        dashboard_plot_count += 1
+
+    st.subheader("Forecasting insights")
+    st.write(
+        f"""
+        The model uses a time-based 80/20 split, so earlier dates are used for training and
+        later dates are used for testing. The best model is **{best_model_name}** based on RMSE.
+
+        Extra features were added beyond the starter baseline: day of week, quarter, lag 7,
+        rolling mean 7, and rolling standard deviation 7. Hyperparameter tuning was performed
+        using TimeSeriesSplit cross-validation, and the final models were evaluated on the
+        held-out future test period.
+
+        The residual chart and residual distribution help diagnose over-prediction and
+        under-prediction. The feature-importance or coefficient chart supports model
+        interpretability by showing which engineered features were most influential.
+        """
+    )
+else:
+    st.warning("Run the modeling section successfully before dashboard plots can be displayed.")
 
 student_insights = st.text_area(
     "Student insights and interpretation",
-    value=(
-        "A time-based split was used so the model is evaluated on later unseen dates. "
-        "The project compares Ridge Regression, Random Forest, and Gradient Boosting. "
-        "Extra features such as day of week, quarter, lag 7, rolling mean 7, and rolling "
-        "standard deviation 7 were added to improve the baseline feature set."
-    ),
-    height=140,
+    value="""This project uses a chronological 80/20 time-based split, so earlier observations are used for training and later observations are used for testing. This avoids data leakage because the model does not train on future observations.
+
+The dataset was checked for missing values, invalid timestamps, invalid target values, and outliers. The timestamp column was parsed as datetime and the target column was converted to numeric. Invalid timestamp or target rows were removed before sorting by date.
+
+The dataset is already daily electricity consumption, so daily frequency is the main modelling frequency. A weekly resampling robustness check is also included to demonstrate how results can change when the time frequency is aggregated.
+
+Multiple models were compared using MAE, RMSE, MAPE, R2, and RMSE confidence intervals. Hyperparameter tuning was performed with TimeSeriesSplit cross-validation. RMSE is used to select the best model because it penalizes larger forecasting errors.
+
+Additional features were created beyond the starter baseline, including day of week, quarter, lag 7, rolling mean 7, and rolling standard deviation 7. These features help capture weekly patterns, recent average demand, recent volatility, and calendar effects.
+
+The dashboard includes actual vs predicted values, prediction error over time, residual distribution, model comparison, and feature importance or coefficient interpretation. These visuals explain both forecast accuracy and model behaviour.""",
+    height=260,
 )
 
 # -----------------------------
@@ -513,32 +678,16 @@ evidence = {
     "feature_rows": int(len(feature_table)),
     "feature_cols": feature_cols,
     "baseline_features_created": True,
-    "student_extra_features": (
-        student_feature_cols if "student_feature_cols" in globals() else []
-    ),
-    "time_based_split_used": bool(isinstance(results_df, pd.DataFrame)),
-    "models_trained": (
-        results_df["model"].tolist() if isinstance(results_df, pd.DataFrame) and "model" in results_df.columns else []
-    ),
-    "metrics_used": (
-        [col for col in results_df.columns if col != "model"] if isinstance(results_df, pd.DataFrame) else []
-    ),
-    "dashboard_plots_added": 3 if isinstance(results_df, pd.DataFrame) else 0,
-    "outlier_check_iqr_target": {
-        "q1": float(work_df[target_col].quantile(0.25)),
-        "q3": float(work_df[target_col].quantile(0.75)),
-        "iqr": float(work_df[target_col].quantile(0.75) - work_df[target_col].quantile(0.25)),
-        "outlier_count": int(
-            (
-                (work_df[target_col] < work_df[target_col].quantile(0.25) - 1.5 * (work_df[target_col].quantile(0.75) - work_df[target_col].quantile(0.25)))
-                | (work_df[target_col] > work_df[target_col].quantile(0.75) + 1.5 * (work_df[target_col].quantile(0.75) - work_df[target_col].quantile(0.25)))
-            ).sum()
-        ),
-    },
-    "missing_timestamps_discussed": True,
-    "resampling_option_evidenced": True,
     "has_metrics_table": has_metrics_table,
     "results_table": results_table,
+    "time_based_split_used": True if isinstance(results_df, pd.DataFrame) else False,
+    "models_used": [] if results_df is None else results_df["model"].tolist(),
+    "hyperparameter_tuning_used": True if isinstance(results_df, pd.DataFrame) else False,
+    "hyperparameter_summary": [] if "hyperparameter_summary" not in globals() else hyperparameter_summary,
+    "dashboard_plot_count": int(dashboard_plot_count),
+    "feature_importance_or_coefficients_shown": True if dashboard_plot_count >= 5 else False,
+    "weekly_resampling_check": False if "weekly_robustness_df" not in globals() else bool(isinstance(weekly_robustness_df, pd.DataFrame) and not weekly_robustness_df.empty),
+    "rmse_confidence_interval_included": True if isinstance(results_df, pd.DataFrame) and "RMSE_CI_low" in results_df.columns else False,
     "student_insights": student_insights,
     "generated_at": datetime.now().isoformat(timespec="seconds"),
 }
@@ -644,3 +793,4 @@ if st.button("Run AI grader"):
                 st.text(raw_output)
         except Exception as exc:
             st.error(f"AI grader request failed: {exc}")
+
